@@ -106,7 +106,9 @@ save(index,tempI_IS,tempI_OS,tempI,file="../output/indices.RData")
 
 # Explanatory Power
 
-```{r}
+```{r, width=100%}
+load("../output/indices.RData")
+load("../data/EURCHF_input.RData")
 # combine data
 alldata <- index %>%
   left_join(EURCHF,by=c("Date"="DATE"))
