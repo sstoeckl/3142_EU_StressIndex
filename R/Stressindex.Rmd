@@ -1,0 +1,130 @@
+---
+title: "R Notebook"
+output:
+  html_notebook: default
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup}
+pacman::p_load(tidyverse,uncertaintymeasures,OECD,xts,zoo,lubridate,lmtest,sandwich)
+```
+
+Now load data:
+
+```{r warning=FALSE, message=FALSE}
+data_2y <- readxl::read_xlsx(path = "../data/Zinsen.xlsx", sheet = "2y", skip=3, na = "#N/A N/A")
+data_10y <- readxl::read_xlsx(path = "../data/Zinsen.xlsx", sheet = "10y", skip=3, na = "#N/A N/A")
+info <- readxl::read_xlsx(path = "../data/Zinsen.xlsx", sheet = "Overview", skip=2)
+
+# "AT"   "BE"   "CY"   "DE"   "EE"   "ES"   "FI"   "FR"   "GR"   "IE"   "IT"   "LT"   "LU"   "LV"   "MT"   "NL"   "PT"   "SI"   "SK"
+# "AUT","BEL","DEU","EST","ESP","FIN","FRA","GRC","IRL","ITA","LTU","LUX","LVA","NLD","POR","CHE","SVK"
+gdp <- get_dataset("QNA",start_time = "1999", end_time = "2020",filter = list(LOCATION=c("AUT","BEL","DEU","EST","ESP","FIN","FRA","GRC","IRL","ITA","LTU","LUX","LVA","NLD","PRT","SVN","SVK"),
+                                                                           SUBJECT=c("B1_GE"),MEASURE="CQRSA",FREQUENCY="Q"))
+
+data <- data_2y %>% rename(DATE=1) %>% mutate(DATE=as.Date(DATE)) %>% filter(!is.na(DATE)) %>% mutate_at(vars(2:20),~as.numeric(.)) %>%
+  pivot_longer(cols=2:20, names_to = "CD2", values_to = "INT_ST") %>%
+  left_join(data_10y %>% rename(DATE=1) %>% mutate(DATE=as.Date(DATE)) %>% filter(!is.na(DATE)) %>% mutate_at(vars(2:20),~as.numeric(.)) %>%
+  pivot_longer(cols=2:20, names_to = "CD2", values_to = "INT_LT"), by=c("DATE","CD2")) %>%
+  inner_join(info %>% rename(COUNTRY=Land,CD2=2,CD3=3) %>% filter(!is.na(GDP)) %>% select(-GDP),by="CD2") %>%
+  left_join(gdp %>% select(LOCATION,DATEq=obsTime,GDP=obsValue) %>% mutate(DATE=as.Date(as.yearqtr(DATEq, format="%Y-Q%q"))) %>% select(-DATEq),
+            by=c("DATE","CD3"="LOCATION")) %>%
+  group_by(CD2) %>%
+  mutate(GDP=na.locf(GDP,na.rm = FALSE),GDP=na.locf(GDP,na.rm = FALSE,fromLast = TRUE))
+data %>% filter(CD2=="AT")
+
+save(data_2y,data_10y,info,gdp,data,file = "../data/all_input.RData")
+```
+
+Import Latent Exchange rate using code from Alex
+
+```{r}
+# code from Alex (original paper)
+load("../data/EURCHF.RData")
+EURCHF_raw <- EURCHF
+load(file = "../data/ShadowCHFEUR.RData")
+# create Date-"Mapper"
+EURCHF <- EURCHF_raw %>% as_tibble() %>% select(DATE,EURCHF=P) %>%
+  mutate(DATEd=year(DATE)+(month(DATE)-1)/12+(day(DATE)-1)/365,DATEdr=round(DATEd,3)) %>%
+  left_join(D$FX %>% as_tibble(),by=c("DATEd"="Date")) %>%
+  left_join(D$Latent %>% as_tibble(),by=c("DATEdr"="Date")) %>%
+  select(DATE,DATEd,EURCHF,EURCHFLatent=FXLatent,upbound,downbound)
+EURCHF %>% filter(DATE>="2014-01-01") %>% as.data.frame()
+
+# replicate plot from paper (Fig 7)
+EURCHF %>% filter(DATE>="2011-05-01")  %>% ggplot(aes(x=DATE)) +
+  geom_line(aes(y=EURCHF),lty=2,lwd=1.2) + geom_line(aes(y=EURCHFLatent),lty=1,lwd=1.2) +
+  geom_line(aes(y=upbound),lty=4,lwd=0.8) + geom_line(aes(y=downbound),lty=4,lwd=0.8) +
+  theme_minimal()
+
+save(EURCHF,file="../data/EURCHF_input.RData")
+```
+
+Now let us calculate the index!
+
+```{r}
+
+tempI <- data %>% ungroup() %>% 
+  filter(Eurozone<=2001) %>% 
+  select(DATE,COUNTRY,INT_ST,INT_LT,GDP)
+
+# check for necessary extra filtering condition
+tempI %>% group_by(COUNTRY) %>% summarise(nn=n(),count_ST=sum(!is.na(INT_ST)),count_LT=sum(!is.na(INT_LT)))
+
+tempI_dat <- tempI %>% select(DATE,COUNTRY,INT_ST,INT_LT) %>% rename("ST"="INT_ST","LT"="INT_LT") %>%
+  pivot_longer(cols = 3:4, names_to = "INT", values_to = "OBS") %>%
+  unite(2:3,col = "VAR") %>% arrange(DATE,VAR) %>%
+  filter(VAR!="Luxemburg_LT") %>%
+  pivot_wider(names_from = VAR, values_from = OBS) %>%
+  timetk::tk_xts(silent = TRUE)
+tempI_wght <- tempI %>% select(DATE,COUNTRY,GDP) %>% mutate(ST=GDP) %>% rename(LT=GDP) %>%
+  pivot_longer(cols = 3:4, names_to = "INT", values_to = "OBS") %>%
+  unite(2:3,col = "VAR") %>% arrange(DATE,VAR) %>%
+  filter(VAR!="Luxemburg_LT") %>%
+  pivot_wider(names_from = VAR, values_from = OBS) %>%
+  timetk::tk_xts(silent = TRUE)
+
+tempI_IS <- ISturbulence(tempI_dat, weights=tempI_wght,  
+                         squared=FALSE, norm=TRUE,#squared = input$ISsquared, norm = input$ISnorm,
+                         GW=FALSE,
+                          s.k = 1) %>% 
+      do.call("cbind",.) %>% timetk::tk_tbl(silent = TRUE)
+tempI_OS <- OSturbulence(tempI_dat, weights=tempI_wght, 
+                          squared=FALSE, norm=TRUE,#squared = input$ISsquared, norm = input$ISnorm,
+                          GW=FALSE,
+                           s.k = 1,
+                           rolling = FALSE, 
+                           roll.obs = 500,
+                           na.obs.min = 500/2)  %>% 
+      do.call("cbind",.) %>% timetk::tk_tbl(silent = TRUE)
+index <- tempI_IS %>% rename_all(~paste0(.,"_IS")) %>% 
+  left_join(tempI_OS %>% rename_all(~paste0(.,"_OS")),by=c("index_IS"="index_OS")) %>%
+             rename(Date=index_IS) %>% mutate(Date=as.Date(Date)) %>% slice((1+1):n())
+
+save(index,tempI_IS,tempI_OS,tempI,file="../output/indices.RData")
+```
+
+# Explanatory Power
+
+```{r}
+# combine data
+alldata <- index %>%
+  left_join(EURCHF,by=c("Date"="DATE"))
+
+# plot Euro-Arera-Stress-Index (turb_IS/turb_OS) against Latent EURCHF Exchange Rate
+alldata %>% filter(Date>="2011-09-06",Date<="2015-01-15") %>%
+  mutate(year=year(Date)) %>%
+  ggplot(aes(x=turb_IS,y=EURCHFLatent, col=year)) + geom_point()
+
+# regression (contemporary explanatory power IS and OS)
+regIS <- lm(EURCHFLatent ~ turb_IS, data=alldata %>% filter(Date>="2011-09-06",Date<="2015-01-15")) # limit to time period of the peg
+summary(regIS)
+coeftest(regIS,NeweyWest(regIS))
+regOS <- lm(EURCHFLatent ~ turb_OS, data=alldata %>% filter(Date>="2011-09-06",Date<="2015-01-15")) # limit to time period of the peg
+summary(regOS)
+coeftest(regOS,NeweyWest(regOS))
+
+```
+
+Great! Should work out of sample
+
